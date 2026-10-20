@@ -1,0 +1,6 @@
+.git
+.github
+.buildx-cache
+.buildx-cache-new
+*.log
+.DS_Store
