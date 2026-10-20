@@ -6,6 +6,18 @@ The image uses the official released Pilot installer, not `--dev`. That avoids c
 
 Ubuntu 24.04 is retained deliberately because it is supported by the official Pilot installer and matches the known-good local Compose setup. Build speed comes from using the prebuilt Pilot release, BuildKit cache, and GHCR layer cache rather than changing to an unverified base distribution.
 
+
+TO RUN 
+
+docker run -d --name pilot \
+  --privileged --cgroupns=host \
+  --tmpfs /run --tmpfs /run/lock \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+  -v pilot-benches:/home/frappe/pilot/benches \
+  -p 8000:8000 -p 8002:8002 -p 9000:9000 -p 7000:7000 \
+  ghcr.io/OWNER/frappe-pilot:latest
+
+  
 ## Local build
 
 ```bash
