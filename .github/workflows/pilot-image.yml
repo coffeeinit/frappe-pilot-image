@@ -83,11 +83,16 @@ jobs:
 
       - name: Build and push release-tagged and latest images
         uses: docker/build-push-action@v6
+        env:
+          # The Actions runner itself uses Node 21+, which prints the DEP0040
+          # punycode warning. Silence only that warning; nothing else changes.
+          NODE_OPTIONS: '--disable-warning=DEP0040'
         with:
           context: .
           push: true
           build-args: |
             PILOT_EXPECTED_RELEASE=${{ needs.check-release.outputs.release }}
+            PILOT_INSTALL_URL=https://raw.githubusercontent.com/frappe/pilot/${{ needs.check-release.outputs.release }}/install.sh
           tags: |
             ghcr.io/${{ github.repository_owner }}/frappe-pilot:${{ needs.check-release.outputs.release }}
             ghcr.io/${{ github.repository_owner }}/frappe-pilot:latest
