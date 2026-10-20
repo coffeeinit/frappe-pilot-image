@@ -14,6 +14,9 @@ permissions:
 jobs:
   check-release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     outputs:
       release: ${{ steps.release.outputs.release }}
       should_build: ${{ steps.decision.outputs.should_build }}
@@ -24,9 +27,15 @@ jobs:
       - name: Read latest official Pilot release
         id: release
         shell: bash
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          release="$(curl -fsSL --retry 3 'https://api.github.com/repos/frappe/pilot/releases?per_page=1' | jq -r '.[0].tag_name')"
+          release="$(curl -fsSL --retry 3 \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            'https://api.github.com/repos/frappe/pilot/releases?per_page=1' \
+            | jq -r '.[0].tag_name')"
           test -n "$release" && test "$release" != "null"
           echo "release=$release" >> "$GITHUB_OUTPUT"
           echo "Official Pilot release: $release"
@@ -38,19 +47,18 @@ jobs:
           IMAGE: ghcr.io/${{ github.repository_owner }}/frappe-pilot
           RELEASE: ${{ steps.release.outputs.release }}
           EVENT_NAME: ${{ github.event_name }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
           should_build=true
           if [ "$EVENT_NAME" = "schedule" ]; then
-            echo "$CR_PAT" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+            echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
             if docker manifest inspect "$IMAGE:$RELEASE" >/dev/null 2>&1; then
               should_build=false
             fi
           fi
           echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
-        env:
-          CR_PAT: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_ACTOR: ${{ github.actor }}
 
   build-and-push:
     needs: check-release
