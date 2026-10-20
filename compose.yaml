@@ -1,0 +1,27 @@
+services:
+  pilot:
+    image: ${PILOT_IMAGE:-local/frappe-pilot:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: frappe-pilot-local
+    hostname: frappe-pilot-local
+    privileged: true
+    cgroup: host
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8002:8002"
+      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:7000:7000"
+    volumes:
+      - pilot_benches:/home/frappe/pilot/benches
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+    tmpfs:
+      - /run
+      - /run/lock
+    stop_signal: SIGRTMIN+3
+    stop_grace_period: 30s
+
+volumes:
+  pilot_benches:

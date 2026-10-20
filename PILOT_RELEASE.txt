@@ -1,0 +1,2 @@
+# Updated by the daily GitHub Actions release check.
+# The workflow uses the official GitHub release tag and does not rely on this file.
