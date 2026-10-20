@@ -56,6 +56,56 @@ RUN if [ "$PILOT_EXPECTED_RELEASE" != "unknown" ]; then \
       echo "Verified Pilot release: $got" ; \
     fi
 
+# Bootstrap MariaDB. install.sh installs MariaDB but never creates a
+# 'frappe'@'localhost' account, and modern MariaDB puts root on unix_socket
+# auth, so `pilot init` fails at secure_installation() with
+#   ERROR 1698 (28000): Access denied for user 'frappe'@'localhost'
+# on a fresh volume. Pre-provision the account here so a container started on
+# a brand-new volume can complete `pilot start` without manual DB surgery.
+#
+# Guarded: if a future install.sh lays MariaDB out elsewhere, this step is
+# skipped instead of failing the build. If the datadir is missing entirely,
+# mariadb-install-db creates one that matches root-on-socket semantics.
+RUN set -eux; \
+    MARIADB_BASE=/home/frappe/pilot/databases/mariadb; \
+    if [ -d "$MARIADB_BASE" ]; then \
+        MARIADB_DATA="$MARIADB_BASE/data"; \
+        MARIADB_RUN="$MARIADB_BASE/run"; \
+        MARIADB_SOCK="$MARIADB_RUN/mysqld.sock"; \
+        mkdir -p "$MARIADB_RUN"; \
+        chown -R frappe:frappe "$MARIADB_BASE"; \
+        if [ ! -d "$MARIADB_DATA/mysql" ]; then \
+            mariadb-install-db \
+                --user=frappe \
+                --datadir="$MARIADB_DATA" \
+                --auth-root-authentication-method=socket; \
+        fi; \
+        mariadbd-safe --user=frappe --datadir="$MARIADB_DATA" --socket="$MARIADB_SOCK" & \
+        MARIADB_PID=$!; \
+        READY=0; \
+        for i in $(seq 1 60); do \
+            if mariadb --socket="$MARIADB_SOCK" -u root -e "SELECT 1" >/dev/null 2>&1; then \
+                READY=1; break; \
+            fi; \
+            sleep 1; \
+        done; \
+        if [ "$READY" != "1" ]; then \
+            echo "MariaDB did not become ready within 60s" >&2; \
+            cat "$MARIADB_BASE"/*.err 2>/dev/null || true; \
+            exit 1; \
+        fi; \
+        mariadb --socket="$MARIADB_SOCK" -u root <<-SQL
+            CREATE USER IF NOT EXISTS 'frappe'@'localhost' IDENTIFIED VIA unix_socket;
+            GRANT ALL PRIVILEGES ON *.* TO 'frappe'@'localhost' WITH GRANT OPTION;
+            FLUSH PRIVILEGES;
+        SQL
+        mariadb-admin --socket="$MARIADB_SOCK" -u root shutdown || true; \
+        wait "$MARIADB_PID" 2>/dev/null || true; \
+        chown -R frappe:frappe "$MARIADB_BASE"; \
+    else \
+        echo "note: ${MARIADB_BASE} not present at build time; skipping MariaDB bootstrap"; \
+    fi
+
 # Pilot owns per-user services; do not leave distro services auto-started.
 # Log rather than silently swallow failures, and tolerate units that were
 # never installed.
