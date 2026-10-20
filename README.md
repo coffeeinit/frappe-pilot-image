@@ -18,6 +18,18 @@ docker run -d --name pilot \
   -v pilot-benches:/home/frappe/pilot/benches \
   -p 8000:8000 -p 8002:8002 -p 9000:9000 -p 7000:7000 \
   ghcr.io/coffeeinit/frappe-pilot:latest
+
+docker volume create pilot-test-fresh
+
+docker run -d --name pilot-test \
+  --privileged --cgroupns=host \
+  --tmpfs /run --tmpfs /run/lock \
+  -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+  -v pilot-test-fresh:/home/frappe/pilot/benches \
+  local/frappe-pilot:test
+# inside: docker exec -it -u frappe pilot-test bash -lc 'pilot new t && pilot -b t start'
+
+
 ```
 
 Admin UI: `http://127.0.0.1:8002`
