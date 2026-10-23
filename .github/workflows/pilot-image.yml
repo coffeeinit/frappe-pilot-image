@@ -1,72 +1,198 @@
+
 name: Build and publish Pilot image
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+
   schedule:
     - cron: "0 3 * * *"
+
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Pilot release tag (empty = newest published release)"
+        type: string
+        required: false
+        default: ""
+
+      force:
+        description: "Force rebuild even if the image exists"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
   packages: write
 
+concurrency:
+  group: pilot-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/frappe-pilot
+  PILOT_REPO: frappe/pilot
+
 jobs:
   check-release:
     runs-on: ubuntu-latest
+
     permissions:
       contents: read
       packages: read
+
     outputs:
       release: ${{ steps.release.outputs.release }}
+      sha: ${{ steps.release.outputs.sha }}
+      publish_latest: ${{ steps.release.outputs.publish_latest }}
       should_build: ${{ steps.decision.outputs.should_build }}
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Read latest official Pilot release
+      - name: Find Pilot release and commit
         id: release
         shell: bash
         env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PILOT_REPO: ${{ env.PILOT_REPO }}
+          REQUESTED: ${{ inputs.release }}
         run: |
           set -euo pipefail
-          release="$(curl -fsSL --retry 3 \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            'https://api.github.com/repos/frappe/pilot/releases?per_page=1' \
-            | jq -r '.[0].tag_name')"
-          test -n "$release" && test "$release" != "null"
-          echo "release=$release" >> "$GITHUB_OUTPUT"
-          echo "Official Pilot release: $release"
 
-      - name: Check whether this release image already exists
+          api() {
+            curl -fsSL \
+              --retry 5 \
+              --retry-delay 3 \
+              --retry-all-errors \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "$1"
+          }
+
+          # GitHub returns releases in pages.
+          # Read pages until the first published release is found.
+          page=1
+          newest=""
+
+          while [ "$page" -le 10 ]; do
+            releases="$(api \
+              "https://api.github.com/repos/${PILOT_REPO}/releases?per_page=100&page=${page}")"
+
+            newest="$(jq -r '
+              [.[] | select(.draft == false)]
+              | sort_by(.published_at // .created_at)
+              | last
+              | .tag_name // empty
+            ' <<< "$releases")"
+
+            if [ -n "$newest" ]; then
+              break
+            fi
+
+            count="$(jq 'length' <<< "$releases")"
+            if [ "$count" -lt 100 ]; then
+              break
+            fi
+
+            page=$((page + 1))
+          done
+
+          if [ -z "$newest" ]; then
+            echo "No published Pilot releases found."
+            exit 1
+          fi
+
+          release="${REQUESTED:-$newest}"
+
+          # Resolve the selected tag to its exact commit.
+          sha="$(api \
+            "https://api.github.com/repos/${PILOT_REPO}/commits/${release}" \
+            | jq -er '.sha')"
+
+          if [ -z "$sha" ] || [ "$sha" = "null" ]; then
+            echo "Could not resolve Pilot release: $release"
+            exit 1
+          fi
+
+          publish_latest=false
+          if [ "$release" = "$newest" ]; then
+            publish_latest=true
+          fi
+
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "publish_latest=$publish_latest" >> "$GITHUB_OUTPUT"
+
+          echo "Newest Pilot release: $newest"
+          echo "Selected release: $release"
+          echo "Commit: $sha"
+          echo "Update latest: $publish_latest"
+
+      - name: Decide whether to build
         id: decision
         shell: bash
         env:
-          IMAGE: ghcr.io/${{ github.repository_owner }}/frappe-pilot
           RELEASE: ${{ steps.release.outputs.release }}
+          PUBLISH_LATEST: ${{ steps.release.outputs.publish_latest }}
           EVENT_NAME: ${{ github.event_name }}
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
+
           should_build=true
-          if [ "$EVENT_NAME" = "schedule" ]; then
-            echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-            if docker manifest inspect "$IMAGE:$RELEASE" >/dev/null 2>&1; then
-              should_build=false
+
+          # Pushes always rebuild.
+          # Manual force always rebuilds.
+          if [ "$EVENT_NAME" != "push" ] &&
+             [ "${FORCE:-false}" != "true" ]; then
+
+            echo "$GH_TOKEN" | docker login ghcr.io \
+              -u "$ACTOR" --password-stdin
+
+            if docker buildx imagetools inspect \
+              "$IMAGE:$RELEASE" >/dev/null 2>&1; then
+
+              if [ "$PUBLISH_LATEST" != "true" ]; then
+                echo "Version image already exists; skipping."
+                should_build=false
+              elif docker pull "$IMAGE:latest" >/dev/null 2>&1; then
+                latest_version="$(docker image inspect \
+                  --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' \
+                  "$IMAGE:latest" 2>/dev/null || true)"
+
+                if [ "$latest_version" = "$RELEASE" ]; then
+                  echo "Version image and latest are current; skipping."
+                  should_build=false
+                else
+                  echo "latest needs updating."
+                fi
+              else
+                echo "latest is missing; rebuilding."
+              fi
             fi
           fi
+
           echo "should_build=$should_build" >> "$GITHUB_OUTPUT"
 
   build-and-push:
     needs: check-release
+
     if: needs.check-release.outputs.should_build == 'true'
+
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     permissions:
       contents: read
       packages: write
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -81,23 +207,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push release-tagged and latest images
+      - name: Build and publish image
         uses: docker/build-push-action@v6
-        env:
-          # The Actions runner itself uses Node 21+, which prints the DEP0040
-          # punycode warning. Silence only that warning; nothing else changes.
-          NODE_OPTIONS: '--disable-warning=DEP0040'
         with:
           context: .
           push: true
+
           build-args: |
             PILOT_EXPECTED_RELEASE=${{ needs.check-release.outputs.release }}
-            PILOT_INSTALL_URL=https://raw.githubusercontent.com/frappe/pilot/${{ needs.check-release.outputs.release }}/install.sh
+            PILOT_COMMIT=${{ needs.check-release.outputs.sha }}
+            PILOT_INSTALL_URL=https://raw.githubusercontent.com/frappe/pilot/${{ needs.check-release.outputs.sha }}/install.sh
+
           tags: |
-            ghcr.io/${{ github.repository_owner }}/frappe-pilot:${{ needs.check-release.outputs.release }}
-            ghcr.io/${{ github.repository_owner }}/frappe-pilot:latest
+            ${{ env.IMAGE }}:${{ needs.check-release.outputs.release }}
+            ${{ needs.check-release.outputs.publish_latest == 'true' && format('{0}:latest', env.IMAGE) || '' }}
+
           labels: |
+            org.opencontainers.image.title=Frappe Pilot
+            org.opencontainers.image.description=Frappe Pilot ${{ needs.check-release.outputs.release }} upstream commit ${{ needs.check-release.outputs.sha }}
             org.opencontainers.image.version=${{ needs.check-release.outputs.release }}
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.check-release.outputs.sha }}
+            org.opencontainers.image.source=https://github.com/${{ env.PILOT_REPO }}
+            org.opencontainers.image.url=https://github.com/${{ env.PILOT_REPO }}
+            org.opencontainers.image.vendor=Frappe
+
           cache-from: type=gha
           cache-to: type=gha,mode=max
